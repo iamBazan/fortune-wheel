@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fortune Wheel | SCREEN</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js" defer></script>
+  </head>
+  <body>
+    <main class="app-shell mode-fullscreen">
+      <div class="layout">
+        <section class="panel wheel-wrap">
+          <div class="pointer"></div>
+          <canvas id="wheelCanvas" width="540" height="540"></canvas>
+        </section>
+
+        <aside class="panel">
+          <h1 class="brand-title">Fortune Wheel – T&M (SCREEN)</h1>
+          <p class="brand-subtitle">Zeskanuj kod QR, aby zakręcić kołem na smartfonie.</p>
+          <div class="qr-box" style="margin-top: .8rem;"><div id="qrCode"></div></div>
+          <p class="helper" id="mobileUrl"></p>
+          <p class="status-badge"><span>●</span><span id="stateLabel">Oczekiwanie na ruch uczestnika</span></p>
+          <p class="telemetry" id="telemetry">kąt: 0.00 | prędkość: 0.00</p>
+        </aside>
+      </div>
+    </main>
+
+    <div class="popup" id="resultPopup">
+      <div class="popup-card">
+        <h2 class="popup-title">Wynik losowania</h2>
+        <p class="popup-prize" id="resultText"></p>
+      </div>
+    </div>
+
+    <script type="module">
+      import { FortuneWheel, MAIN_PRIZE } from "./wheel.js";
+      import { watchSpinState, resetSpinState } from "./firebase.js";
+      import { fireMainPrizeConfetti } from "./confetti.js";
+
+      const canvas = document.getElementById("wheelCanvas");
+      const wheel = new FortuneWheel(canvas, { onTick: playTick });
+      const stateLabel = document.getElementById("stateLabel");
+      const telemetry = document.getElementById("telemetry");
+      const popup = document.getElementById("resultPopup");
+      const resultText = document.getElementById("resultText");
+      let activeSessionId = null;
+
+      const mobileUrl = `${window.location.origin}${window.location.pathname.replace("screen.html", "mobile.html")}`;
+      document.getElementById("mobileUrl").textContent = mobileUrl;
+
+      // Render QR code for quick onboarding at event booth.
+      new QRCode(document.getElementById("qrCode"), {
+        text: mobileUrl,
+        width: 190,
+        height: 190,
+        colorDark: "#1A1F28",
+        colorLight: "#ffffff",
+      });
+
+      function playTick() {
+        // AudioContext requires user gesture; on screen we keep it silent if blocked.
+      }
+
+      function animateFromPayload(payload) {
+        if (!payload || payload.sessionId === activeSessionId) return;
+        if (payload.animationState !== "spinning") return;
+
+        activeSessionId = payload.sessionId;
+        stateLabel.textContent = "Animacja trwa...";
+
+        gsap.to(wheel, {
+          rotation: payload.targetRotation,
+          duration: payload.duration,
+          ease: "power4.out",
+          onUpdate: () => {
+            wheel.draw();
+          },
+          onComplete: async () => {
+            stateLabel.textContent = "Ruch zakończony";
+          },
+        });
+      }
+
+      watchSpinState(async (state) => {
+        if (!state) return;
+
+        if (typeof state.currentAngle === "number" || typeof state.spinVelocity === "number") {
+          telemetry.textContent = `kąt: ${(state.currentAngle || 0).toFixed(2)} | prędkość: ${(state.spinVelocity || 0).toFixed(2)}`;
+        }
+
+        if (state.animationState === "spinning") {
+          animateFromPayload(state);
+        }
+
+        if (state.animationState === "finished") {
+          wheel.setRotation(state.finalAngle || wheel.rotation);
+          resultText.textContent = state.finalResult || "Brak wyniku";
+          popup.classList.add("show");
+          stateLabel.textContent = "Losowanie zakończone";
+
+          if (state.finalResult === MAIN_PRIZE) {
+            fireMainPrizeConfetti();
+          }
+
+          setTimeout(async () => {
+            popup.classList.remove("show");
+            activeSessionId = null;
+            stateLabel.textContent = "Oczekiwanie na ruch uczestnika";
+            await resetSpinState();
+          }, 5000);
+        }
+      });
+    </script>
+  </body>
+</html>
