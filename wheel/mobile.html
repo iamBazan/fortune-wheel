@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="pl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fortune Wheel | MOBILE</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <div class="layout">
+        <section class="panel wheel-wrap">
+          <div class="pointer"></div>
+          <canvas id="wheelCanvas" width="540" height="540"></canvas>
+        </section>
+
+        <aside class="panel">
+          <h1 class="brand-title">Fortune Wheel – T&M (MOBILE)</h1>
+          <p class="brand-subtitle">Naciśnij START (audio), następnie wykonaj szybki swipe w obszarze poniżej.</p>
+          <div class="controls" style="margin-top: .8rem;">
+            <button class="button" id="startButton">START</button>
+            <div class="swipe-area" id="swipeArea">Przeciągnij palcem poziomo, aby zakręcić kołem</div>
+            <p class="status-badge"><span>●</span><span id="status">Oczekiwanie na START</span></p>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <div class="popup" id="resultPopup">
+      <div class="popup-card">
+        <h2 class="popup-title">Twój wynik</h2>
+        <p class="popup-prize" id="resultText"></p>
+      </div>
+    </div>
+
+    <script type="module">
+      import {
+        FortuneWheel,
+        SEGMENTS,
+        secureRandomInt,
+        computeTargetRotation,
+        MAIN_PRIZE,
+      } from "./wheel.js";
+      import {
+        publishSpinStart,
+        publishSpinProgress,
+        publishSpinEnd,
+        watchSpinState,
+      } from "./firebase.js";
+
+      const canvas = document.getElementById("wheelCanvas");
+      const wheel = new FortuneWheel(canvas, { onTick: () => tickSound() });
+      const startButton = document.getElementById("startButton");
+      const swipeArea = document.getElementById("swipeArea");
+      const statusEl = document.getElementById("status");
+      const popup = document.getElementById("resultPopup");
+      const resultText = document.getElementById("resultText");
+
+      let audioReady = false;
+      let spinning = sessionStorage.getItem("tm-wheel-lock") === "1";
+      let gesture = null;
+      let audioCtx;
+
+      function updateStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function enableAudio() {
+        if (!audioCtx) audioCtx = new AudioContext();
+        audioCtx.resume();
+        audioReady = true;
+        updateStatus(spinning ? "Losowanie już w toku" : "Audio aktywne. Wykonaj swipe");
+        startButton.disabled = true;
+      }
+
+      function tickSound() {
+        if (!audioReady || !audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = "square";
+        osc.frequency.value = 1200;
+        gain.gain.value = 0.01;
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.03);
+      }
+
+      function getSwipeVelocity(startEvent, endEvent) {
+        const dx = endEvent.clientX - startEvent.clientX;
+        const dt = Math.max(16, endEvent.time - startEvent.time);
+        return dx / dt;
+      }
+
+      async function startSpinFromVelocity(swipeVelocity) {
+        if (spinning) return;
+        spinning = true;
+        sessionStorage.setItem("tm-wheel-lock", "1");
+
+        // Winner generation is cryptographically secure and independent from animation config.
+        const resultIndex = secureRandomInt(SEGMENTS.length);
+        const extraSpins = 6 + secureRandomInt(3);
+        const duration = Math.min(8, Math.max(4.5, Math.abs(swipeVelocity) * 4.5));
+        const targetRotation = computeTargetRotation({
+          currentRotation: wheel.rotation,
+          resultIndex,
+          extraSpins,
+        });
+        const finalResult = SEGMENTS[resultIndex];
+        const sessionId = `spin-${Date.now()}-${secureRandomInt(10_000)}`;
+
+        updateStatus("Kręcenie... powodzenia!");
+
+        await publishSpinStart({
+          sessionId,
+          resultIndex,
+          finalResult,
+          currentAngle: wheel.rotation,
+          spinVelocity: swipeVelocity,
+          targetRotation,
+          duration,
+        });
+
+        let lastSent = 0;
+        const tween = gsap.to(wheel, {
+          rotation: targetRotation,
+          duration,
+          ease: "power4.out",
+          onUpdate: async () => {
+            wheel.draw();
+            const now = performance.now();
+            if (now - lastSent > 120) {
+              lastSent = now;
+              const progress = tween.progress();
+              const velocity = (1 - progress) * swipeVelocity;
+              publishSpinProgress({ currentAngle: wheel.rotation, spinVelocity: velocity });
+            }
+          },
+          onComplete: async () => {
+            await publishSpinEnd({ resultIndex, finalResult, finalAngle: wheel.rotation });
+            updateStatus("Losowanie zakończone");
+          },
+        });
+      }
+
+      startButton.addEventListener("click", enableAudio);
+
+      swipeArea.addEventListener("pointerdown", (event) => {
+        if (!audioReady || spinning) return;
+        gesture = { clientX: event.clientX, time: event.timeStamp };
+      });
+
+      swipeArea.addEventListener("pointerup", async (event) => {
+        if (!gesture || spinning || !audioReady) return;
+        const velocity = getSwipeVelocity(gesture, { clientX: event.clientX, time: event.timeStamp });
+        gesture = null;
+        if (Math.abs(velocity) < 0.2) {
+          updateStatus("Swipe zbyt wolny. Spróbuj dynamiczniej.");
+          return;
+        }
+        await startSpinFromVelocity(velocity);
+      });
+
+      // Listen for completed state to display synchronized final result popup.
+      watchSpinState((state) => {
+        if (!state) return;
+        if (state.animationState === "finished") {
+          resultText.textContent = state.finalResult || "Brak wyniku";
+          popup.classList.add("show");
+
+          setTimeout(() => {
+            popup.classList.remove("show");
+            spinning = false;
+            sessionStorage.removeItem("tm-wheel-lock");
+            updateStatus("Gotowe na kolejnego uczestnika");
+          }, 5000);
+
+          if (state.finalResult === MAIN_PRIZE) {
+            updateStatus("Gratulacje! Nagroda główna 🎉");
+          }
+        }
+      });
+
+      if (spinning) {
+        updateStatus("Losowanie już aktywne. Poczekaj na zakończenie.");
+      }
+    </script>
+  </body>
+</html>
